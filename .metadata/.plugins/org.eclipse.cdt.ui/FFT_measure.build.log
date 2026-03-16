@@ -1,0 +1,10 @@
+13:07:06 **** Incremental Build of configuration Debug for project FFT_measure ****
+make -j14 all 
+arm-none-eabi-size  FFT_measure.elf 
+   text	   data	    bss	    dec	    hex	filename
+ 174796	    472	 111776	 287044	  46144	FFT_measure.elf
+Finished building: default.size.stdout
+ 
+
+13:07:06 Build Finished. 0 errors, 0 warnings. (took 319ms)
+

@@ -1,0 +1,26 @@
+Required CMSIS-DSP Source Files for 128-point Real FFT:
+
+Transform Functions:
+  Drivers/CMSIS/DSP/Source/TransformFunctions/arm_rfft_fast_f32.c
+  Drivers/CMSIS/DSP/Source/TransformFunctions/arm_rfft_fast_init_f32.c
+  Drivers/CMSIS/DSP/Source/TransformFunctions/arm_cfft_f32.c
+  Drivers/CMSIS/DSP/Source/TransformFunctions/arm_cfft_init_f32.c
+  Drivers/CMSIS/DSP/Source/TransformFunctions/arm_bitreversal2.c
+
+Common Tables:
+  Drivers/CMSIS/DSP/Source/CommonTables/arm_common_tables.c
+  Drivers/CMSIS/DSP/Source/CommonTables/arm_const_structs.c
+
+Complex Math:
+  Drivers/CMSIS/DSP/Source/ComplexMathFunctions/arm_cmplx_mag_f32.c
+
+Statistics:
+  Drivers/CMSIS/DSP/Source/StatisticsFunctions/arm_max_f32.c
+
+Fast Math:
+  Drivers/CMSIS/DSP/Source/FastMathFunctions/arm_sin_f32.c
+  Drivers/CMSIS/DSP/Source/FastMathFunctions/arm_cos_f32.c
+
+You can either:
+A) Add entire Source folders to your build path
+B) Copy these specific files to Core/Src/
