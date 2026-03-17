@@ -39,8 +39,8 @@
 #define FFT_SIZE 256
 #define ACTUAL_SAMPLES 185  // Number of real samples per chirp
 */
-#define FFT_SIZE 128
-#define ACTUAL_SAMPLES 128  // Number of real samples per chirp
+#define FFT_SIZE 192
+#define ACTUAL_SAMPLES 192  // Number of real samples per chirp
 
 #define NUM_CHIRPS 32       // Number of chirps to process
 /* USER CODE END PD */
