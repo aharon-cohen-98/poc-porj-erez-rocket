@@ -74,15 +74,12 @@ SDRAM_HandleTypeDef hsdram1;
 kiss_fftr_cfg kiss_rfft_cfg = NULL;
 arm_cfft_instance_f32 cfft_instance;
 
-// Kiss FFT real output: nfft/2+1 complex for 128-point real FFT
-static kiss_fft_cpx kiss_rfft_out[FFT_SIZE/2 + 1];
+// Kiss FFT real output: nfft/2+1 complex for 128-point real FFT (DTCM for range-FFT hot path)
+__attribute__((section(".dtcm_ram"), aligned(32))) static kiss_fft_cpx kiss_rfft_out[FFT_SIZE/2 + 1];
 
-// OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
-// With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
-// More realistic for continuous ADC streaming operation
+// Range-FFT input in DTCM for minimal latency; other buffers in default RAM
+__attribute__((section(".dtcm_ram"), aligned(32))) float32_t fft_input[FFT_SIZE];      // FFT input buffer (1 KB)
 __attribute__((aligned(32))) float32_t chirp_data[NUM_CHIRPS][ACTUAL_SAMPLES];  // 32 chirps of 185 samples (~23 KB)
-__attribute__((aligned(32))) float32_t fft_input[FFT_SIZE];      // FFT input buffer (1 KB) - ADC data copied here
-__attribute__((aligned(32))) float32_t fft_output[FFT_SIZE];     // FFT output buffer (1 KB)
 __attribute__((aligned(32))) float32_t cfft_buffer[NUM_CHIRPS * 2]; // Complex FFT working buffer (256 bytes)
 
 // Large intermediate storage in regular RAM (AXI SRAM - fast but not as fast as DTCM)
@@ -173,6 +170,20 @@ static void MX_ADC1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// Pack KISS real FFT output (65 complex) to CMSIS 128-float layout; unrolled by 4
+static inline void pack_kiss_to_cmsis(const kiss_fft_cpx * restrict in, float32_t * restrict out)
+{
+  out[0] = in[0].r;
+  out[1] = in[FFT_SIZE/2].r;
+  for (uint32_t k = 1; k < FFT_SIZE/2; k += 4)
+  {
+    kiss_fft_cpx a = in[k], b = in[k+1], c = in[k+2], d = in[k+3];
+    float32_t *p = &out[2*k];
+    p[0] = a.r; p[1] = a.i; p[2] = b.r; p[3] = b.i;
+    p[4] = c.r; p[5] = c.i; p[6] = d.r; p[7] = d.i;
+  }
+}
+
 // ITM redirect for printf - sends output to SWV/ITM console
 int _write(int file, char *ptr, int len)
 {
@@ -213,7 +224,7 @@ int main(void)
 
   // Verify arrays are in DTCM (should be 0x20000000-0x2001FFFF range)
   uint32_t input_addr = (uint32_t)&fft_input[0];
-  uint32_t output_addr = (uint32_t)&fft_output[0];
+  uint32_t output_addr = (uint32_t)&fft_outputs[0][0];
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -425,14 +436,7 @@ int main(void)
     fft_input[i] *= hamming_window_range[i];
   }
   kiss_fftr(kiss_rfft_cfg, (const kiss_fft_scalar*)fft_input, kiss_rfft_out);
-  // Pack Kiss output (65 complex) to CMSIS-style 128-float layout for downstream
-  fft_output[0] = kiss_rfft_out[0].r;
-  fft_output[1] = kiss_rfft_out[FFT_SIZE/2].r;
-  for (uint32_t k = 1; k < FFT_SIZE/2; k++)
-  {
-    fft_output[2*k]     = kiss_rfft_out[k].r;
-    fft_output[2*k + 1] = kiss_rfft_out[k].i;
-  }
+  pack_kiss_to_cmsis(kiss_rfft_out, fft_outputs[0]);
 
   // Process all 32 chirps and measure windowing and FFT computation time separately
   total_range_fft_cycles = 0;
@@ -464,21 +468,9 @@ int main(void)
     // Measure ONLY the FFT computation (Kiss FFT + pack to CMSIS layout)
     uint32_t start_cycles = DWT->CYCCNT;
     kiss_fftr(kiss_rfft_cfg, (const kiss_fft_scalar*)fft_input, kiss_rfft_out);
-    fft_output[0] = kiss_rfft_out[0].r;
-    fft_output[1] = kiss_rfft_out[FFT_SIZE/2].r;
-    for (uint32_t k = 1; k < FFT_SIZE/2; k++)
-    {
-      fft_output[2*k]     = kiss_rfft_out[k].r;
-      fft_output[2*k + 1] = kiss_rfft_out[k].i;
-    }
+    pack_kiss_to_cmsis(kiss_rfft_out, fft_outputs[chirp]);
     uint32_t end_cycles = DWT->CYCCNT;
     total_range_fft_cycles += (end_cycles - start_cycles);
-
-    // Store FFT result - NOT TIMED
-    for (uint32_t i = 0; i < FFT_SIZE; i++)
-    {
-      fft_outputs[chirp][i] = fft_output[i];
-    }
   }
 
   // Calculate average range FFT execution time per chirp
