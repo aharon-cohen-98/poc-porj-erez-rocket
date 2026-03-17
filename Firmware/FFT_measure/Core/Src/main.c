@@ -34,7 +34,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+ 
 /*
 #define FFT_SIZE 256
 #define ACTUAL_SAMPLES 185  // Number of real samples per chirp
