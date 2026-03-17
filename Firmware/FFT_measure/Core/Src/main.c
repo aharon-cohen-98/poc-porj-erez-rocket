@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
+#include "fft_192.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -73,6 +74,7 @@ SDRAM_HandleTypeDef hsdram1;
 /* USER CODE BEGIN PV */
 arm_rfft_fast_instance_f32 rfft_instance;
 arm_cfft_instance_f32 cfft_instance;
+arm_cfft_instance_f32 cfft_64_instance;  // 64-point CFFT for 192-point composite (3x64)
 
 // OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
 // With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
@@ -249,6 +251,7 @@ int main(void)
   // Initialize FFT instances
   arm_rfft_fast_init_f32(&rfft_instance, FFT_SIZE);      // 128-point real FFT for range
   arm_cfft_init_f32(&cfft_instance, NUM_CHIRPS);          // 32-point complex FFT for Doppler
+  arm_cfft_init_f32(&cfft_64_instance, 64);              // 64-point CFFT for 192-point composite (3x64)
 
   // Generate Hamming window coefficients for Range FFT (128 points)
   // Hamming window: w(n) = 0.54 - 0.46 * cos(2*pi*n/(N-1))
