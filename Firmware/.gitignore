@@ -48,3 +48,4 @@ cmake_install.cmake
 .vscode/
 *.code-workspace
 Firmware/FFT_measure/Debug/
+.metadata/Debug/
