@@ -39,8 +39,8 @@
 #define FFT_SIZE 256
 #define ACTUAL_SAMPLES 185  // Number of real samples per chirp
 */
-#define FFT_SIZE 192
-#define ACTUAL_SAMPLES 192  // Number of real samples per chirp
+#define FFT_SIZE 256
+#define ACTUAL_SAMPLES 256  // Number of real samples per chirp
 
 #define NUM_CHIRPS 32       // Number of chirps to process
 /* USER CODE END PD */
@@ -95,6 +95,11 @@ __attribute__((aligned(32))) float32_t fft_magnitude[FFT_SIZE/2];               
 __attribute__((aligned(32))) float32_t rd_map_magnitude_sq[FFT_SIZE/2][NUM_CHIRPS];  // Pre-computed |FFT|^2 for all cells (8 KB)
 __attribute__((aligned(32))) float32_t rd_map_windowed_energy[FFT_SIZE/2][NUM_CHIRPS];  // Pre-computed 5×5 windowed energy (8 KB)
 __attribute__((aligned(32))) float32_t rd_map_windowed_temp[FFT_SIZE/2][NUM_CHIRPS];  // Pre-computed 5×5 windowed energy (8 KB)
+
+// Cache-friendly vertical pass: scratch [velocity][row_block] so column access is sequential
+#define RD_VERT_BLOCK 16
+#define RD_VERT_SCRATCH_ROWS (RD_VERT_BLOCK + 5)  // block_rows + WINDOW_SIZE (5)
+__attribute__((aligned(32))) float32_t rd_vert_scratch[NUM_CHIRPS][RD_VERT_SCRATCH_ROWS];
 
 // ADC DMA buffer for continuous data acquisition (2 MSPS at 16-bit)
 // Using circular buffer - DMA will continuously overwrite this
@@ -677,24 +682,36 @@ int main(void)
   uint32_t row_end_cycles = DWT->CYCCNT;
   uint32_t row_cycles = row_end_cycles - row_start_cycles;
 
-  // STEP 2b: Vertical pass - compute 5×1 sum for each column
-  // Process FULL columns
+  // STEP 2b: Vertical pass - 5×1 sum per column, CACHE-FRIENDLY (linear scaling with range bins)
+  // Process in row blocks; copy block into transposed scratch [v][r] so walking by r is sequential
   uint32_t col_start_cycles = DWT->CYCCNT;
-  for (uint32_t v = WINDOW_HALF; v < (NUM_CHIRPS - WINDOW_HALF); v++)
-  {
-    // Initial window (rows 0-4) for this column
-    float32_t sum = rd_map_windowed_temp[0][v] +
-                    rd_map_windowed_temp[1][v] +
-                    rd_map_windowed_temp[2][v] +
-                    rd_map_windowed_temp[3][v] +
-                    rd_map_windowed_temp[4][v];
-    rd_map_windowed_energy[WINDOW_HALF][v] = sum;
+  const uint32_t num_range_rows = FFT_SIZE/2;
+  const uint32_t r_valid_end = num_range_rows - WINDOW_HALF;
 
-    // Slide window down column (rows 3-61)
-    for (uint32_t r = WINDOW_HALF + 1; r < (FFT_SIZE/2 - WINDOW_HALF); r++)
+  for (uint32_t r_start = WINDOW_HALF; r_start < r_valid_end; r_start += RD_VERT_BLOCK)
+  {
+    uint32_t block_rows = r_valid_end - r_start;
+    if (block_rows > RD_VERT_BLOCK)
+      block_rows = RD_VERT_BLOCK;
+    uint32_t read_start = r_start - WINDOW_HALF;
+    uint32_t read_count = block_rows + WINDOW_SIZE;
+
+    for (uint32_t v = 0; v < NUM_CHIRPS; v++)
     {
-      sum = sum - rd_map_windowed_temp[r - WINDOW_HALF - 1][v] + rd_map_windowed_temp[r + WINDOW_HALF][v];
-      rd_map_windowed_energy[r][v] = sum;
+      for (uint32_t r_local = 0; r_local < read_count; r_local++)
+        rd_vert_scratch[v][r_local] = rd_map_windowed_temp[read_start + r_local][v];
+    }
+
+    for (uint32_t v = WINDOW_HALF; v < (NUM_CHIRPS - WINDOW_HALF); v++)
+    {
+      float32_t * __restrict pCol = rd_vert_scratch[v];
+      float32_t sum = pCol[0] + pCol[1] + pCol[2] + pCol[3] + pCol[4];
+
+      for (uint32_t r_local = 0; r_local < block_rows; r_local++)
+      {
+        rd_map_windowed_energy[r_start + r_local][v] = sum;
+        sum = sum - pCol[r_local] + pCol[r_local + WINDOW_SIZE];
+      }
     }
   }
 
