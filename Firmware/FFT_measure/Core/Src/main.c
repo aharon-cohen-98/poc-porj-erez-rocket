@@ -39,8 +39,8 @@
 #define FFT_SIZE 256
 #define ACTUAL_SAMPLES 185  // Number of real samples per chirp
 */
-#define FFT_SIZE 128
-#define ACTUAL_SAMPLES 128  // Number of real samples per chirp
+#define FFT_SIZE 192
+#define ACTUAL_SAMPLES 192  // Number of real samples per chirp
 
 #define NUM_CHIRPS 32       // Number of chirps to process
 /* USER CODE END PD */
@@ -74,21 +74,21 @@ SDRAM_HandleTypeDef hsdram1;
 kiss_fftr_cfg kiss_rfft_cfg = NULL;
 arm_cfft_instance_f32 cfft_instance;
 
-// Kiss FFT real output: nfft/2+1 complex for 128-point real FFT
+// Kiss FFT real output: nfft/2+1 complex for 192-point real FFT
 static kiss_fft_cpx kiss_rfft_out[FFT_SIZE/2 + 1];
 
 // OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
 // With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
 // More realistic for continuous ADC streaming operation
-__attribute__((aligned(32))) float32_t chirp_data[NUM_CHIRPS][ACTUAL_SAMPLES];  // 32 chirps of 185 samples (~23 KB)
+__attribute__((aligned(32))) float32_t chirp_data[NUM_CHIRPS][ACTUAL_SAMPLES];  // 32 chirps of 192 samples
 __attribute__((aligned(32))) float32_t fft_input[FFT_SIZE];      // FFT input buffer (1 KB) - ADC data copied here
 __attribute__((aligned(32))) float32_t fft_output[FFT_SIZE];     // FFT output buffer (1 KB)
 __attribute__((aligned(32))) float32_t cfft_buffer[NUM_CHIRPS * 2]; // Complex FFT working buffer (256 bytes)
 
 // Large intermediate storage in regular RAM (AXI SRAM - fast but not as fast as DTCM)
 __attribute__((aligned(32))) float32_t fft_outputs[NUM_CHIRPS][FFT_SIZE];       // 32 FFT results (32 KB)
-__attribute__((aligned(32))) float32_t range_bins[FFT_SIZE/2][NUM_CHIRPS * 2];  // 128 bins x 32 complex samples (32 KB)
-__attribute__((aligned(32))) float32_t doppler_fft[FFT_SIZE/2][NUM_CHIRPS * 2]; // 128 Doppler FFT results (32 KB)
+__attribute__((aligned(32))) float32_t range_bins[FFT_SIZE/2][NUM_CHIRPS * 2];  // 96 bins x 32 complex samples
+__attribute__((aligned(32))) float32_t doppler_fft[FFT_SIZE/2][NUM_CHIRPS * 2]; // 96 Doppler FFT results
 __attribute__((aligned(32))) float32_t fft_magnitude[FFT_SIZE/2];                // 512 bytes
 
 // Temporary arrays for optimized peak detection
@@ -113,7 +113,7 @@ uint32_t range_fft_cycles;
 float32_t range_fft_time_us;
 uint32_t total_range_fft_cycles;    // Total cycles for all 32 range FFTs
 float32_t total_range_fft_time_us;
-uint32_t total_doppler_fft_cycles;  // Total cycles for all 64 Doppler FFTs (128-point FFT has 64 bins)
+uint32_t total_doppler_fft_cycles;  // Total cycles for all 96 Doppler FFTs (192-point FFT has 96 bins)
 float32_t total_doppler_fft_time_us;      // Average Doppler FFT time in microseconds
 uint32_t doppler_fft_cycles;        // Average cycles per Doppler FFT
 float32_t doppler_fft_time_us;      // Average Doppler FFT time in microseconds
@@ -125,14 +125,14 @@ float32_t range_window_time_us;           // Average range window time in micros
 float32_t total_range_window_time_us;           // Average range window time in microseconds
 
 // Doppler windowing performance metrics
-uint32_t total_doppler_window_cycles;     // Total cycles for all 64 Doppler window applications
+uint32_t total_doppler_window_cycles;     // Total cycles for all 96 Doppler window applications
 uint32_t doppler_window_cycles;           // Average cycles per Doppler window application
 float32_t doppler_window_time_us;         // Average Doppler window time in microseconds
 float32_t total_doppler_window_time_us;         // Average Doppler window time in microseconds
 
 // Range-Doppler map peak detection results (5x5 windowed energy)
 float32_t rd_map_peak_energy;             // Maximum windowed energy in Range-Doppler map
-uint32_t rd_map_peak_range_bin;           // Range bin index of peak center (0-63)
+uint32_t rd_map_peak_range_bin;           // Range bin index of peak center (0-95)
 uint32_t rd_map_peak_velocity_bin;        // Velocity bin index of peak center (0-31)
 float32_t rd_map_peak_range_m;            // Actual range in meters
 float32_t rd_map_peak_velocity_mps;       // Actual velocity in m/s
@@ -252,7 +252,7 @@ int main(void)
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
   // Initialize FFT instances
-  kiss_rfft_cfg = kiss_fftr_alloc(FFT_SIZE, 0, NULL, NULL);  // 128-point real FFT for range (0 = forward)
+  kiss_rfft_cfg = kiss_fftr_alloc(FFT_SIZE, 0, NULL, NULL);  // 192-point real FFT for range (0 = forward)
   if (kiss_rfft_cfg == NULL)
   {
     printf("ERROR: kiss_fftr_alloc failed for Range FFT\r\n");
@@ -260,7 +260,7 @@ int main(void)
   }
   arm_cfft_init_f32(&cfft_instance, NUM_CHIRPS);          // 32-point complex FFT for Doppler
 
-  // Generate Hamming window coefficients for Range FFT (128 points)
+  // Generate Hamming window coefficients for Range FFT (192 points)
   // Hamming window: w(n) = 0.54 - 0.46 * cos(2*pi*n/(N-1))
   // Reduces spectral leakage by tapering signal at edges
   for (uint32_t n = 0; n < FFT_SIZE; n++)
@@ -316,7 +316,7 @@ int main(void)
   float32_t sampling_freq = 2000000.0f;  // 2 MSPS actual ADC rate
 
   // Extract chirps from circular ADC buffer
-  // Each chirp is ACTUAL_SAMPLES (185) consecutive samples
+  // Each chirp is ACTUAL_SAMPLES (192) consecutive samples
   uint32_t adc_index = 0;  // Starting position in ADC buffer
 
 #define USE_TEST_SIGNAL 1  // Set to 0 to use real ADC input
@@ -332,7 +332,7 @@ int main(void)
   const float32_t c = 3.0e8f;                          // Speed of light (m/s)
   const float32_t radar_freq_hz = 77.0e9f;             // Radar center frequency: 77 GHz (automotive radar)
   const float32_t chirp_bandwidth_hz = 150.0e6f;       // Chirp bandwidth: 150 MHz
-  const float32_t chirp_duration_s = (float32_t)ACTUAL_SAMPLES / sampling_freq;  // 64 µs for 128 samples at 2 MSPS
+  const float32_t chirp_duration_s = (float32_t)ACTUAL_SAMPLES / sampling_freq;  // 96 µs for 192 samples at 2 MSPS
   const float32_t chirp_repetition_interval_s = 100.0e-6f;  // 100 µs between chirps (PRI)
 
   // ===== Simulated Target Parameters =====
@@ -427,7 +427,7 @@ int main(void)
     fft_input[i] *= hamming_window_range[i];
   }
   kiss_fftr(kiss_rfft_cfg, (const kiss_fft_scalar*)fft_input, kiss_rfft_out);
-  // Pack Kiss output (65 complex) to CMSIS-style 128-float layout for downstream
+  // Pack Kiss output (97 complex) to CMSIS-style 192-float layout for downstream
   fft_output[0] = kiss_rfft_out[0].r;
   fft_output[1] = kiss_rfft_out[FFT_SIZE/2].r;
   for (uint32_t k = 1; k < FFT_SIZE/2; k++)
@@ -442,7 +442,7 @@ int main(void)
 
   for (uint32_t chirp = 0; chirp < NUM_CHIRPS; chirp++)
   {
-    // Copy chirp data to FFT input buffer (128 samples) - NOT TIMED
+    // Copy chirp data to FFT input buffer (192 samples) - NOT TIMED
     for (uint32_t i = 0; i < ACTUAL_SAMPLES; i++)
     {
       fft_input[i] = chirp_data[chirp][i];
@@ -507,20 +507,20 @@ int main(void)
       }
       else
       {
-        // Bins 1-127: complex pairs starting at position [2]
+        // Bins 1-95: complex pairs starting at position [2]
         range_bins[bin][chirp * 2 + 0] = fft_outputs[chirp][bin * 2];      // Real
         range_bins[bin][chirp * 2 + 1] = fft_outputs[chirp][bin * 2 + 1];  // Imag
       }
     }
   }
 
-  // range_bins[128][64] now contains reorganized data:
+  // range_bins[96][64] now contains reorganized data:
   // range_bins[bin][0,1] = complex sample from chirp 0, bin N (real, imag)
   // range_bins[bin][2,3] = complex sample from chirp 1, bin N (real, imag)
   // ...
   // range_bins[bin][62,63] = complex sample from chirp 31, bin N (real, imag)
 
-  // === STEP 3: Doppler FFT (128 complex FFTs across chirps) ===
+  // === STEP 3: Doppler FFT (96 complex FFTs across chirps) ===
 
   // Warm-up run for complex FFT with windowing
   for (uint32_t i = 0; i < NUM_CHIRPS * 2; i++)
@@ -536,7 +536,7 @@ int main(void)
   }
   arm_cfft_f32(&cfft_instance, cfft_buffer, 0, 1);
 
-  // Process all 64 range bins and measure windowing and FFT computation time separately
+  // Process all 96 range bins and measure windowing and FFT computation time separately
   total_doppler_fft_cycles = 0;
   total_doppler_window_cycles = 0;
 
@@ -797,20 +797,20 @@ int main(void)
   // - DMA writes to adc_buffer[] in AXI SRAM (circular buffer)
   // - CPU extracts chirps and converts uint16_t → float32_t
   // - Hamming windows applied to both Range and Doppler FFTs
-  //   * Range: 128-point window reduces spectral leakage in range dimension
+  //   * Range: 192-point window reduces spectral leakage in range dimension
   //   * Doppler: 32-point window reduces spectral leakage in velocity dimension
   // - FFT runs directly from AXI SRAM (no copy to DTCM)
   // - D-Cache enabled for good performance despite AXI SRAM access
   // - DMA and FFT share AXI bus → realistic memory contention
   //
-  // EXPECTED PERFORMANCE (128-point Range FFT, 32-point Doppler FFT):
-  // - Range Hamming window: ~100-300 cycles (128 float multiplications)
-  // - Range FFT: ~4-6K cycles (128-point real FFT)
+  // EXPECTED PERFORMANCE (192-point Range FFT, 32-point Doppler FFT):
+  // - Range Hamming window: ~150-450 cycles (192 float multiplications)
+  // - Range FFT: ~6-9K cycles (192-point real FFT)
   // - Doppler Hamming window: ~50-100 cycles (64 float multiplications for complex data)
   // - Doppler FFT: ~2-3K cycles per 32-point complex FFT
-  // - Total processing: ~200-300K cycles (~0.7-1.1 ms at 280 MHz)
-  // - ADC chirp time: 64 µs (128 samples at 2 MSPS)
-  // - 32 chirps: 2.048 ms → plenty of time for FFT processing
+  // - Total processing: ~300-450K cycles (~1.1-1.6 ms at 280 MHz)
+  // - ADC chirp time: 96 µs (192 samples at 2 MSPS)
+  // - 32 chirps: 3.072 ms → plenty of time for FFT processing
   //
   // VERIFICATION:
   // - adc_changes: Number of ADC samples captured (should be > 0)
@@ -818,17 +818,17 @@ int main(void)
   //
   // INPUT DATA:
   // - adc_buffer[8192]: Raw 16-bit ADC samples (circular buffer)
-  // - chirp_data[32][128]: Converted float32_t chirps from ADC data
-  // - hamming_window_range[128]: Pre-computed 128-point Hamming window for Range FFT
+  // - chirp_data[32][192]: Converted float32_t chirps from ADC data
+  // - hamming_window_range[192]: Pre-computed 192-point Hamming window for Range FFT
   // - hamming_window_doppler[32]: Pre-computed 32-point Hamming window for Doppler FFT
   //
   // RANGE FFT RESULTS:
-  // - fft_outputs[32][128]: 32 range FFT results organized by chirp (windowed)
-  // - range_bins[64][64]: reorganized as 64 range bins x 32 complex samples
+  // - fft_outputs[32][192]: 32 range FFT results organized by chirp (windowed)
+  // - range_bins[96][64]: reorganized as 96 range bins x 32 complex samples
   //   * range_bins[0][0..63] = bin 0 from all 32 chirps (Re0,Im0, Re1,Im1, ..., Re31,Im31)
   //
   // DOPPLER FFT RESULTS:
-  // - doppler_fft[64][64]: 64 Doppler FFT results (64 range bins x 32 velocity bins, windowed)
+  // - doppler_fft[96][64]: 96 Doppler FFT results (96 range bins x 32 velocity bins, windowed)
   //   * doppler_fft[range][0..63] = 32 complex velocity bins for this range bin
   //   * This is the final Range-Doppler map!
   //
@@ -836,23 +836,23 @@ int main(void)
   //
   // Range FFT Processing (32 chirps):
   // - total_range_window_cycles: total CPU cycles for 32 range window applications
-  // - range_window_cycles: average cycles per range window (~100-300 expected)
+  // - range_window_cycles: average cycles per range window (~150-450 expected)
   // - range_window_time_us: average range window time in microseconds
   // - total_range_fft_cycles: total CPU cycles for 32 range FFTs
-  // - fft_cycles: average cycles per range FFT (~4-6K expected for 128-point)
+  // - fft_cycles: average cycles per range FFT (~6-9K expected for 192-point)
   // - fft_time_us: average range FFT time in microseconds
   //
-  // Doppler FFT Processing (64 range bins):
-  // - total_doppler_window_cycles: total CPU cycles for 64 Doppler window applications
+  // Doppler FFT Processing (96 range bins):
+  // - total_doppler_window_cycles: total CPU cycles for 96 Doppler window applications
   // - doppler_window_cycles: average cycles per Doppler window (~50-100 expected)
   // - doppler_window_time_us: average Doppler window time in microseconds
-  // - total_doppler_fft_cycles: total CPU cycles for 64 Doppler FFTs
+  // - total_doppler_fft_cycles: total CPU cycles for 96 Doppler FFTs
   // - doppler_fft_cycles: average cycles per Doppler FFT (~2-3K expected)
   // - doppler_fft_time_us: average Doppler FFT time in microseconds
   //
   // RANGE-DOPPLER MAP PEAK DETECTION (5×5 Windowed Energy - HIGHLY OPTIMIZED):
   // - rd_map_peak_energy: Maximum windowed energy (sum of 25 cells in 5×5 window)
-  // - rd_map_peak_range_bin: Range bin index (2-61) at center of peak window
+  // - rd_map_peak_range_bin: Range bin index (2-93) at center of peak window
   // - rd_map_peak_velocity_bin: Velocity bin index (2-29) at center of peak window
   // - rd_map_peak_range_m: Calculated range in meters (based on radar parameters)
   // - rd_map_peak_velocity_mps: Calculated velocity in m/s (based on radar parameters)
@@ -871,7 +871,7 @@ int main(void)
   // The 5×5 window integrates energy over a neighborhood for better SNR and noise rejection.
   // Set a breakpoint here to inspect the peak location and energy.
   //
-  // - fft_magnitude[64]: magnitude spectrum of first chirp (64 bins for 128-point real FFT)
+  // - fft_magnitude[96]: magnitude spectrum of first chirp (96 bins for 192-point real FFT)
   // - peak_frequency: depends on input signal
 
   /* USER CODE END 2 */
