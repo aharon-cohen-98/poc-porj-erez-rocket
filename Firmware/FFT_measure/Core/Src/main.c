@@ -18,10 +18,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "kiss_fft.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
+#include "kiss_fftr.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -71,8 +71,11 @@ UART_HandleTypeDef huart1;
 SDRAM_HandleTypeDef hsdram1;
 
 /* USER CODE BEGIN PV */
-arm_rfft_fast_instance_f32 rfft_instance;
+kiss_fftr_cfg kiss_rfft_cfg = NULL;
 arm_cfft_instance_f32 cfft_instance;
+
+// Kiss FFT real output: nfft/2+1 complex for 128-point real FFT
+static kiss_fft_cpx kiss_rfft_out[FFT_SIZE/2 + 1];
 
 // OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
 // With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
@@ -247,7 +250,12 @@ int main(void)
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
   // Initialize FFT instances
-  arm_rfft_fast_init_f32(&rfft_instance, FFT_SIZE);      // 128-point real FFT for range
+  kiss_rfft_cfg = kiss_fftr_alloc(FFT_SIZE, 0, NULL, NULL);  // 128-point real FFT for range (0 = forward)
+  if (kiss_rfft_cfg == NULL)
+  {
+    printf("ERROR: kiss_fftr_alloc failed for Range FFT\r\n");
+    for (;;) { __NOP(); }  // Halt on allocation failure
+  }
   arm_cfft_init_f32(&cfft_instance, NUM_CHIRPS);          // 32-point complex FFT for Doppler
 
   // Generate Hamming window coefficients for Range FFT (128 points)
@@ -416,7 +424,15 @@ int main(void)
   {
     fft_input[i] *= hamming_window_range[i];
   }
-  arm_rfft_fast_f32(&rfft_instance, fft_input, fft_output, 0);
+  kiss_fftr(kiss_rfft_cfg, (const kiss_fft_scalar*)fft_input, kiss_rfft_out);
+  // Pack Kiss output (65 complex) to CMSIS-style 128-float layout for downstream
+  fft_output[0] = kiss_rfft_out[0].r;
+  fft_output[1] = kiss_rfft_out[FFT_SIZE/2].r;
+  for (uint32_t k = 1; k < FFT_SIZE/2; k++)
+  {
+    fft_output[2*k]     = kiss_rfft_out[k].r;
+    fft_output[2*k + 1] = kiss_rfft_out[k].i;
+  }
 
   // Process all 32 chirps and measure windowing and FFT computation time separately
   total_range_fft_cycles = 0;
@@ -445,9 +461,16 @@ int main(void)
     uint32_t window_end_cycles = DWT->CYCCNT;
     total_range_window_cycles += (window_end_cycles - window_start_cycles);
 
-    // Measure ONLY the FFT computation
+    // Measure ONLY the FFT computation (Kiss FFT + pack to CMSIS layout)
     uint32_t start_cycles = DWT->CYCCNT;
-    arm_rfft_fast_f32(&rfft_instance, fft_input, fft_output, 0);
+    kiss_fftr(kiss_rfft_cfg, (const kiss_fft_scalar*)fft_input, kiss_rfft_out);
+    fft_output[0] = kiss_rfft_out[0].r;
+    fft_output[1] = kiss_rfft_out[FFT_SIZE/2].r;
+    for (uint32_t k = 1; k < FFT_SIZE/2; k++)
+    {
+      fft_output[2*k]     = kiss_rfft_out[k].r;
+      fft_output[2*k + 1] = kiss_rfft_out[k].i;
+    }
     uint32_t end_cycles = DWT->CYCCNT;
     total_range_fft_cycles += (end_cycles - start_cycles);
 

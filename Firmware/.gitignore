@@ -47,5 +47,5 @@ cmake_install.cmake
 # VS Code specific (Personal settings)
 .vscode/
 *.code-workspace
-Firmware/FFT_measure/Debug/
+FFT_measure/Debug/
 .metadata/Debug/
