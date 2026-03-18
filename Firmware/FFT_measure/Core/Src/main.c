@@ -116,10 +116,28 @@ __attribute__((aligned(32))) float32_t range_fft_64_buf2[64 * 2];
 __attribute__((aligned(32))) float32_t range_twiddle_w1[(FFT_SIZE/2 + 1) * 2];
 __attribute__((aligned(32))) float32_t range_twiddle_w2[(FFT_SIZE/2 + 1) * 2];
 
+// Range FFT timing (overall per chirp and totals)
 uint32_t range_fft_cycles;
 float32_t range_fft_time_us;
 uint32_t total_range_fft_cycles;    // Total cycles for all 32 range FFTs
 float32_t total_range_fft_time_us;
+
+// Detailed Range FFT timing (demux, 3×64 CFFTs, combine/pack)
+uint32_t total_range_demux_cycles;      // Sum over all chirps
+uint32_t total_range_cfft_cycles;       // Sum of three 64-pt CFFTs over all chirps
+uint32_t total_range_combine_cycles;    // Sum of combine + pack over all chirps
+
+uint32_t range_demux_cycles;            // Avg per chirp
+uint32_t range_cfft_cycles;             // Avg per chirp
+uint32_t range_combine_cycles;          // Avg per chirp
+
+float32_t range_demux_time_us;          // Avg per chirp
+float32_t range_cfft_time_us;           // Avg per chirp
+float32_t range_combine_time_us;        // Avg per chirp
+
+float32_t total_range_demux_time_us;    // Totals over all chirps
+float32_t total_range_cfft_time_us;
+float32_t total_range_combine_time_us;
 uint32_t total_doppler_fft_cycles;  // Total cycles for all 64 Doppler FFTs (128-point FFT has 64 bins)
 float32_t total_doppler_fft_time_us;      // Average Doppler FFT time in microseconds
 uint32_t doppler_fft_cycles;        // Average cycles per Doppler FFT
@@ -204,6 +222,8 @@ static inline void cmul_f32(float32_t a_re, float32_t a_im,
 // Output packed like CMSIS `arm_rfft_fast_f32`: DC, Nyquist, then Re/Im pairs.
 static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packed_out)
 {
+  uint32_t t0 = DWT->CYCCNT;
+
   // Demux: seq_r[n2] = x[n1 + 3*n2] with n1=r, n2=0..63 (NOT contiguous blocks of 64)
   for (uint32_t n2 = 0; n2 < 64; n2++)
   {
@@ -215,9 +235,13 @@ static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packe
     range_fft_64_buf2[2u * n2 + 1u] = 0.0f;
   }
 
+  uint32_t t1 = DWT->CYCCNT;
+
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf0, 0, 1);
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf1, 0, 1);
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf2, 0, 1);
+
+  uint32_t t2 = DWT->CYCCNT;
 
   const float32_t w_re = -0.5f;
   const float32_t w_im = -0.8660254037844386f;
@@ -277,6 +301,12 @@ static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packe
       packed_out[1] = y1_re; /* Re{X[96]} Nyquist */
     }
   }
+
+  uint32_t t3 = DWT->CYCCNT;
+
+  total_range_demux_cycles   += (t1 - t0);
+  total_range_cfft_cycles    += (t2 - t1);
+  total_range_combine_cycles += (t3 - t2);
 }
 
 /* USER CODE END 0 */
@@ -534,6 +564,9 @@ int main(void)
   // Process all 32 chirps and measure windowing and FFT computation time separately
   total_range_fft_cycles = 0;
   total_range_window_cycles = 0;
+  total_range_demux_cycles = 0;
+  total_range_cfft_cycles = 0;
+  total_range_combine_cycles = 0;
 
   for (uint32_t chirp = 0; chirp < NUM_CHIRPS; chirp++)
   {
@@ -580,6 +613,19 @@ int main(void)
   range_window_cycles = total_range_window_cycles / NUM_CHIRPS;
   range_window_time_us = (float32_t)range_window_cycles / 280.0f;
   total_range_window_time_us = (float32_t)total_range_window_cycles / 280.0f;
+
+  // Calculate detailed Range FFT breakdown per chirp and totals
+  range_demux_cycles     = total_range_demux_cycles / NUM_CHIRPS;
+  range_cfft_cycles      = total_range_cfft_cycles / NUM_CHIRPS;
+  range_combine_cycles   = total_range_combine_cycles / NUM_CHIRPS;
+
+  range_demux_time_us    = (float32_t)range_demux_cycles / 280.0f;
+  range_cfft_time_us     = (float32_t)range_cfft_cycles / 280.0f;
+  range_combine_time_us  = (float32_t)range_combine_cycles / 280.0f;
+
+  total_range_demux_time_us   = (float32_t)total_range_demux_cycles / 280.0f;
+  total_range_cfft_time_us    = (float32_t)total_range_cfft_cycles / 280.0f;
+  total_range_combine_time_us = (float32_t)total_range_combine_cycles / 280.0f;
 
   // Reorganize FFT outputs from [chirp][bin] to [bin][chirp] format
   // This creates a range-Doppler matrix suitable for 2D FFT processing
@@ -849,11 +895,17 @@ int main(void)
   printf("\r\n--- Timing Performance @ 280 MHz ---\r\n");
   printf("Range Window:   %6lu cycles (%7.2f us) [avg per chirp]\r\n", range_window_cycles, range_window_time_us);
   printf("Range FFT:      %6lu cycles (%7.2f us) [avg per chirp]\r\n", range_fft_cycles, range_fft_time_us);
+  printf("  Range Demux:  %6lu cycles (%7.2f us) [avg per chirp]\r\n", range_demux_cycles, range_demux_time_us);
+  printf("  Range 3xCFFT: %6lu cycles (%7.2f us) [avg per chirp]\r\n", range_cfft_cycles, range_cfft_time_us);
+  printf("  Range Comb.:  %6lu cycles (%7.2f us) [avg per chirp]\r\n", range_combine_cycles, range_combine_time_us);
   printf("Doppler Window: %6lu cycles (%7.2f us) [avg per bin]\r\n", doppler_window_cycles, doppler_window_time_us);
   printf("Doppler FFT:    %6lu cycles (%7.2f us) [avg per bin]\r\n", doppler_fft_cycles, doppler_fft_time_us);
 
   printf("Range Window Total:   %6lu cycles (%7.2f us)\r\n", total_range_window_cycles, total_range_window_time_us);
   printf("Range FFT Total:      %6lu cycles (%7.2f us)\r\n", total_range_fft_cycles, total_range_fft_time_us);
+  printf("  Range Demux Total:  %6lu cycles (%7.2f us)\r\n", total_range_demux_cycles, total_range_demux_time_us);
+  printf("  Range 3xCFFT Total: %6lu cycles (%7.2f us)\r\n", total_range_cfft_cycles, total_range_cfft_time_us);
+  printf("  Range Comb. Total:  %6lu cycles (%7.2f us)\r\n", total_range_combine_cycles, total_range_combine_time_us);
   printf("Doppler Window Total: %6lu cycles (%7.2f us)\r\n", total_doppler_window_cycles, total_doppler_window_time_us);
   printf("Doppler FFT Total:    %6lu cycles (%7.2f us)\r\n", total_doppler_fft_cycles, total_doppler_fft_time_us);
   printf("Peak Detection: %6lu cycles (%7.2f us)\r\n", peak_detection_cycles, peak_detection_time_us);
