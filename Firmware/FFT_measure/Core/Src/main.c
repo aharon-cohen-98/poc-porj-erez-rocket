@@ -39,8 +39,8 @@
 #define FFT_SIZE 256
 #define ACTUAL_SAMPLES 185  // Number of real samples per chirp
 */
-#define FFT_SIZE 128
-#define ACTUAL_SAMPLES 128  // Number of real samples per chirp
+#define FFT_SIZE 192
+#define ACTUAL_SAMPLES 192  // Number of real samples per chirp
 
 #define NUM_CHIRPS 32       // Number of chirps to process
 /* USER CODE END PD */
@@ -71,21 +71,21 @@ UART_HandleTypeDef huart1;
 SDRAM_HandleTypeDef hsdram1;
 
 /* USER CODE BEGIN PV */
-arm_rfft_fast_instance_f32 rfft_instance;
 arm_cfft_instance_f32 cfft_instance;
+arm_cfft_instance_f32 cfft_64_instance;  // 64-point CFFT for 192-point (3×64) Range FFT
 
 // OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
 // With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
 // More realistic for continuous ADC streaming operation
-__attribute__((aligned(32))) float32_t chirp_data[NUM_CHIRPS][ACTUAL_SAMPLES];  // 32 chirps of 185 samples (~23 KB)
-__attribute__((aligned(32))) float32_t fft_input[FFT_SIZE];      // FFT input buffer (1 KB) - ADC data copied here
-__attribute__((aligned(32))) float32_t fft_output[FFT_SIZE];     // FFT output buffer (1 KB)
+__attribute__((aligned(32))) float32_t chirp_data[NUM_CHIRPS][ACTUAL_SAMPLES];
+__attribute__((aligned(32))) float32_t fft_input[FFT_SIZE];
+__attribute__((aligned(32))) float32_t fft_output[FFT_SIZE];
 __attribute__((aligned(32))) float32_t cfft_buffer[NUM_CHIRPS * 2]; // Complex FFT working buffer (256 bytes)
 
 // Large intermediate storage in regular RAM (AXI SRAM - fast but not as fast as DTCM)
 __attribute__((aligned(32))) float32_t fft_outputs[NUM_CHIRPS][FFT_SIZE];       // 32 FFT results (32 KB)
-__attribute__((aligned(32))) float32_t range_bins[FFT_SIZE/2][NUM_CHIRPS * 2];  // 128 bins x 32 complex samples (32 KB)
-__attribute__((aligned(32))) float32_t doppler_fft[FFT_SIZE/2][NUM_CHIRPS * 2]; // 128 Doppler FFT results (32 KB)
+__attribute__((aligned(32))) float32_t range_bins[FFT_SIZE/2][NUM_CHIRPS * 2];
+__attribute__((aligned(32))) float32_t doppler_fft[FFT_SIZE/2][NUM_CHIRPS * 2];
 __attribute__((aligned(32))) float32_t fft_magnitude[FFT_SIZE/2];                // 512 bytes
 
 // Temporary arrays for optimized peak detection
@@ -105,6 +105,16 @@ __attribute__((aligned(32))) float32_t hamming_window_range[FFT_SIZE];
 // Hamming window coefficients for Doppler FFT (complex FFT)
 // Applied to 32 complex samples (across chirps for each range bin)
 __attribute__((aligned(32))) float32_t hamming_window_doppler[NUM_CHIRPS];
+
+// 192-point Range FFT (3×64) working buffers and twiddles
+// - 3 complex buffers, each holds 64 complex samples (Re,Im interleaved) => 128 floats each
+__attribute__((aligned(32))) float32_t range_fft_64_buf0[64 * 2];
+__attribute__((aligned(32))) float32_t range_fft_64_buf1[64 * 2];
+__attribute__((aligned(32))) float32_t range_fft_64_buf2[64 * 2];
+// Twiddles for W192^k and W192^(2k) for k=0..(N/2), stored as complex (Re,Im)
+// For N=192, this covers k=0..96 inclusive (97 values).
+__attribute__((aligned(32))) float32_t range_twiddle_w1[(FFT_SIZE/2 + 1) * 2];
+__attribute__((aligned(32))) float32_t range_twiddle_w2[(FFT_SIZE/2 + 1) * 2];
 
 uint32_t range_fft_cycles;
 float32_t range_fft_time_us;
@@ -180,6 +190,126 @@ int _write(int file, char *ptr, int len)
   return len;
 }
 
+static inline void cmul_f32(float32_t a_re, float32_t a_im,
+                            float32_t b_re, float32_t b_im,
+                            float32_t *out_re, float32_t *out_im)
+{
+  *out_re = a_re * b_re - a_im * b_im;
+  *out_im = a_re * b_im + a_im * b_re;
+}
+
+// 192-point real-input FFT implemented as mixed-radix 3×64 complex FFT.
+// Output is packed to match CMSIS-DSP `arm_rfft_fast_f32` convention:
+// - out[0]  = Re{X[0]}
+// - out[1]  = Re{X[N/2]} (Nyquist)
+// - out[2k] = Re{X[k]}, out[2k+1] = Im{X[k]} for k=1..(N/2-1)
+static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packed_out)
+{
+  // Demux into 3 blocks of 64, store as complex (imag=0)
+  for (uint32_t n = 0; n < 64; n++)
+  {
+    range_fft_64_buf0[2u * n + 0u] = time_in[n + 0u];
+    range_fft_64_buf0[2u * n + 1u] = 0.0f;
+
+    range_fft_64_buf1[2u * n + 0u] = time_in[n + 64u];
+    range_fft_64_buf1[2u * n + 1u] = 0.0f;
+
+    range_fft_64_buf2[2u * n + 0u] = time_in[n + 128u];
+    range_fft_64_buf2[2u * n + 1u] = 0.0f;
+  }
+
+  // 3× 64-point complex FFTs
+  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf0, 0, 1);
+  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf1, 0, 1);
+  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf2, 0, 1);
+
+  // Constants for 3-point DFT combine:
+  // ω  = e^{-j 2π/3} = -1/2 - j*sqrt(3)/2
+  // ω² = e^{-j 4π/3} = -1/2 + j*sqrt(3)/2
+  const float32_t w_re = -0.5f;
+  const float32_t w_im = -0.8660254037844386f;   // -sqrt(3)/2
+  const float32_t w2_re = -0.5f;
+  const float32_t w2_im = 0.8660254037844386f;   // +sqrt(3)/2
+
+  // We only need bins 0..N/2 (0..96) for packed real FFT output.
+  // Compute X[k] for k=0..96 from the mixed-radix combine.
+  for (uint32_t k = 0; k <= 96u; k++)
+  {
+    // Each of the three 64-FFTs provides X_m[k mod 64].
+    const uint32_t km = (k < 64u) ? k : (k - 64u);
+
+    const float32_t x0_re = range_fft_64_buf0[2u * km + 0u];
+    const float32_t x0_im = range_fft_64_buf0[2u * km + 1u];
+
+    const float32_t x1_re0 = range_fft_64_buf1[2u * km + 0u];
+    const float32_t x1_im0 = range_fft_64_buf1[2u * km + 1u];
+    const float32_t x2_re0 = range_fft_64_buf2[2u * km + 0u];
+    const float32_t x2_im0 = range_fft_64_buf2[2u * km + 1u];
+
+    // Apply twiddles: A1 = X1 * W192^{k}, A2 = X2 * W192^{2k}
+    const float32_t tw1_re = range_twiddle_w1[2u * k + 0u];
+    const float32_t tw1_im = range_twiddle_w1[2u * k + 1u];
+    const float32_t tw2_re = range_twiddle_w2[2u * k + 0u];
+    const float32_t tw2_im = range_twiddle_w2[2u * k + 1u];
+
+    float32_t a1_re, a1_im, a2_re, a2_im;
+    cmul_f32(x1_re0, x1_im0, tw1_re, tw1_im, &a1_re, &a1_im);
+    cmul_f32(x2_re0, x2_im0, tw2_re, tw2_im, &a2_re, &a2_im);
+
+    // 3-point DFT across {A0, A1, A2}
+    // Y0 = A0 + A1 + A2
+    const float32_t y0_re = x0_re + a1_re + a2_re;
+    const float32_t y0_im = x0_im + a1_im + a2_im;
+
+    // Precompute A1*ω, A1*ω², A2*ω, A2*ω²
+    float32_t a1w_re, a1w_im, a1w2_re, a1w2_im;
+    float32_t a2w_re, a2w_im, a2w2_re, a2w2_im;
+    cmul_f32(a1_re, a1_im, w_re, w_im, &a1w_re, &a1w_im);
+    cmul_f32(a1_re, a1_im, w2_re, w2_im, &a1w2_re, &a1w2_im);
+    cmul_f32(a2_re, a2_im, w_re, w_im, &a2w_re, &a2w_im);
+    cmul_f32(a2_re, a2_im, w2_re, w2_im, &a2w2_re, &a2w2_im);
+
+    // Y1 = A0 + A1*ω + A2*ω²
+    const float32_t y1_re = x0_re + a1w_re + a2w2_re;
+    const float32_t y1_im = x0_im + a1w_im + a2w2_im;
+
+    // Y2 = A0 + A1*ω² + A2*ω
+    const float32_t y2_re = x0_re + a1w2_re + a2w_re;
+    const float32_t y2_im = x0_im + a1w2_im + a2w_im;
+
+    // Select which mixed-radix output corresponds to bin k:
+    // - for k = 0..63   -> X[k]   = Y0
+    // - for k = 64..127 -> X[k]   = Y1 (k-64)
+    // - for k = 128..191-> X[k]   = Y2 (k-128)
+    float32_t xk_re, xk_im;
+    if (k < 64u)
+    {
+      xk_re = y0_re;
+      xk_im = y0_im;
+    }
+    else
+    {
+      xk_re = y1_re;
+      xk_im = y1_im;
+    }
+
+    // Pack to CMSIS RFFT format
+    if (k == 0u)
+    {
+      packed_out[0] = xk_re;
+    }
+    else if (k == 96u)
+    {
+      packed_out[1] = xk_re; // Nyquist real
+    }
+    else
+    {
+      packed_out[2u * k + 0u] = xk_re;
+      packed_out[2u * k + 1u] = xk_im;
+    }
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -247,10 +377,10 @@ int main(void)
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
   // Initialize FFT instances
-  arm_rfft_fast_init_f32(&rfft_instance, FFT_SIZE);      // 128-point real FFT for range
   arm_cfft_init_f32(&cfft_instance, NUM_CHIRPS);          // 32-point complex FFT for Doppler
+  arm_cfft_init_f32(&cfft_64_instance, 64);               // 64-point complex FFT for 192-point (3×64) Range FFT
 
-  // Generate Hamming window coefficients for Range FFT (128 points)
+  // Generate Hamming window coefficients for Range FFT (FFT_SIZE points)
   // Hamming window: w(n) = 0.54 - 0.46 * cos(2*pi*n/(N-1))
   // Reduces spectral leakage by tapering signal at edges
   for (uint32_t n = 0; n < FFT_SIZE; n++)
@@ -263,6 +393,20 @@ int main(void)
   for (uint32_t n = 0; n < NUM_CHIRPS; n++)
   {
     hamming_window_doppler[n] = 0.54f - 0.46f * arm_cos_f32(2.0f * PI * (float32_t)n / (float32_t)(NUM_CHIRPS - 1));
+  }
+
+  // Precompute twiddles for the 192-point (3×64) Range FFT combine step.
+  // W192^k = exp(-j*2*pi*k/192) and W192^(2k) = exp(-j*4*pi*k/192)
+  for (uint32_t k = 0; k <= (FFT_SIZE/2); k++)
+  {
+    float32_t a1 = -2.0f * PI * (float32_t)k / (float32_t)FFT_SIZE;
+    float32_t a2 = -4.0f * PI * (float32_t)k / (float32_t)FFT_SIZE;
+
+    range_twiddle_w1[2u * k + 0u] = arm_cos_f32(a1);
+    range_twiddle_w1[2u * k + 1u] = arm_sin_f32(a1);
+
+    range_twiddle_w2[2u * k + 0u] = arm_cos_f32(a2);
+    range_twiddle_w2[2u * k + 1u] = arm_sin_f32(a2);
   }
 
   // ===================================================================
@@ -416,7 +560,7 @@ int main(void)
   {
     fft_input[i] *= hamming_window_range[i];
   }
-  arm_rfft_fast_f32(&rfft_instance, fft_input, fft_output, 0);
+  range_fft_192_real_packed(fft_input, fft_output);
 
   // Process all 32 chirps and measure windowing and FFT computation time separately
   total_range_fft_cycles = 0;
@@ -424,7 +568,7 @@ int main(void)
 
   for (uint32_t chirp = 0; chirp < NUM_CHIRPS; chirp++)
   {
-    // Copy chirp data to FFT input buffer (128 samples) - NOT TIMED
+    // Copy chirp data to FFT input buffer - NOT TIMED
     for (uint32_t i = 0; i < ACTUAL_SAMPLES; i++)
     {
       fft_input[i] = chirp_data[chirp][i];
@@ -447,7 +591,7 @@ int main(void)
 
     // Measure ONLY the FFT computation
     uint32_t start_cycles = DWT->CYCCNT;
-    arm_rfft_fast_f32(&rfft_instance, fft_input, fft_output, 0);
+    range_fft_192_real_packed(fft_input, fft_output);
     uint32_t end_cycles = DWT->CYCCNT;
     total_range_fft_cycles += (end_cycles - start_cycles);
 
