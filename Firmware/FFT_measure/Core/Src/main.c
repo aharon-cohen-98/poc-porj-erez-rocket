@@ -198,70 +198,53 @@ static inline void cmul_f32(float32_t a_re, float32_t a_im,
   *out_im = a_re * b_im + a_im * b_re;
 }
 
-// 192-point real-input FFT implemented as mixed-radix 3×64 complex FFT.
-// Output is packed to match CMSIS-DSP `arm_rfft_fast_f32` convention:
-// - out[0]  = Re{X[0]}
-// - out[1]  = Re{X[N/2]} (Nyquist)
-// - out[2k] = Re{X[k]}, out[2k+1] = Im{X[k]} for k=1..(N/2-1)
+// 192-point real-input FFT: Cooley–Tukey N=3×64 with time index n = n1 + 3*n2
+// (polyphase-by-3 demux). Three 64-pt CFFTs then twiddle + 3-point DFT.
+// X[k2 + 64*r] = sum_{n1=0}^{2} F[n1,k2] * W_192^{(k2 + 64*r)*n1}, r=0,1,2.
+// Output packed like CMSIS `arm_rfft_fast_f32`: DC, Nyquist, then Re/Im pairs.
 static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packed_out)
 {
-  // Demux into 3 blocks of 64, store as complex (imag=0)
-  for (uint32_t n = 0; n < 64; n++)
+  // Demux: seq_r[n2] = x[n1 + 3*n2] with n1=r, n2=0..63 (NOT contiguous blocks of 64)
+  for (uint32_t n2 = 0; n2 < 64; n2++)
   {
-    range_fft_64_buf0[2u * n + 0u] = time_in[n + 0u];
-    range_fft_64_buf0[2u * n + 1u] = 0.0f;
-
-    range_fft_64_buf1[2u * n + 0u] = time_in[n + 64u];
-    range_fft_64_buf1[2u * n + 1u] = 0.0f;
-
-    range_fft_64_buf2[2u * n + 0u] = time_in[n + 128u];
-    range_fft_64_buf2[2u * n + 1u] = 0.0f;
+    range_fft_64_buf0[2u * n2 + 0u] = time_in[3u * n2 + 0u];
+    range_fft_64_buf0[2u * n2 + 1u] = 0.0f;
+    range_fft_64_buf1[2u * n2 + 0u] = time_in[3u * n2 + 1u];
+    range_fft_64_buf1[2u * n2 + 1u] = 0.0f;
+    range_fft_64_buf2[2u * n2 + 0u] = time_in[3u * n2 + 2u];
+    range_fft_64_buf2[2u * n2 + 1u] = 0.0f;
   }
 
-  // 3× 64-point complex FFTs
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf0, 0, 1);
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf1, 0, 1);
   arm_cfft_f32(&cfft_64_instance, range_fft_64_buf2, 0, 1);
 
-  // Constants for 3-point DFT combine:
-  // ω  = e^{-j 2π/3} = -1/2 - j*sqrt(3)/2
-  // ω² = e^{-j 4π/3} = -1/2 + j*sqrt(3)/2
   const float32_t w_re = -0.5f;
-  const float32_t w_im = -0.8660254037844386f;   // -sqrt(3)/2
+  const float32_t w_im = -0.8660254037844386f;
   const float32_t w2_re = -0.5f;
-  const float32_t w2_im = 0.8660254037844386f;   // +sqrt(3)/2
+  const float32_t w2_im = 0.8660254037844386f;
 
-  // We only need bins 0..N/2 (0..96) for packed real FFT output.
-  // Compute X[k] for k=0..96 from the mixed-radix combine.
-  for (uint32_t k = 0; k <= 96u; k++)
+  for (uint32_t k2 = 0; k2 < 64; k2++)
   {
-    // Each of the three 64-FFTs provides X_m[k mod 64].
-    const uint32_t km = (k < 64u) ? k : (k - 64u);
+    const float32_t x0_re = range_fft_64_buf0[2u * k2 + 0u];
+    const float32_t x0_im = range_fft_64_buf0[2u * k2 + 1u];
+    const float32_t x1_re0 = range_fft_64_buf1[2u * k2 + 0u];
+    const float32_t x1_im0 = range_fft_64_buf1[2u * k2 + 1u];
+    const float32_t x2_re0 = range_fft_64_buf2[2u * k2 + 0u];
+    const float32_t x2_im0 = range_fft_64_buf2[2u * k2 + 1u];
 
-    const float32_t x0_re = range_fft_64_buf0[2u * km + 0u];
-    const float32_t x0_im = range_fft_64_buf0[2u * km + 1u];
-
-    const float32_t x1_re0 = range_fft_64_buf1[2u * km + 0u];
-    const float32_t x1_im0 = range_fft_64_buf1[2u * km + 1u];
-    const float32_t x2_re0 = range_fft_64_buf2[2u * km + 0u];
-    const float32_t x2_im0 = range_fft_64_buf2[2u * km + 1u];
-
-    // Apply twiddles: A1 = X1 * W192^{k}, A2 = X2 * W192^{2k}
-    const float32_t tw1_re = range_twiddle_w1[2u * k + 0u];
-    const float32_t tw1_im = range_twiddle_w1[2u * k + 1u];
-    const float32_t tw2_re = range_twiddle_w2[2u * k + 0u];
-    const float32_t tw2_im = range_twiddle_w2[2u * k + 1u];
+    const float32_t tw1_re = range_twiddle_w1[2u * k2 + 0u];
+    const float32_t tw1_im = range_twiddle_w1[2u * k2 + 1u];
+    const float32_t tw2_re = range_twiddle_w2[2u * k2 + 0u];
+    const float32_t tw2_im = range_twiddle_w2[2u * k2 + 1u];
 
     float32_t a1_re, a1_im, a2_re, a2_im;
     cmul_f32(x1_re0, x1_im0, tw1_re, tw1_im, &a1_re, &a1_im);
     cmul_f32(x2_re0, x2_im0, tw2_re, tw2_im, &a2_re, &a2_im);
 
-    // 3-point DFT across {A0, A1, A2}
-    // Y0 = A0 + A1 + A2
     const float32_t y0_re = x0_re + a1_re + a2_re;
     const float32_t y0_im = x0_im + a1_im + a2_im;
 
-    // Precompute A1*ω, A1*ω², A2*ω, A2*ω²
     float32_t a1w_re, a1w_im, a1w2_re, a1w2_im;
     float32_t a2w_re, a2w_im, a2w2_re, a2w2_im;
     cmul_f32(a1_re, a1_im, w_re, w_im, &a1w_re, &a1w_im);
@@ -269,43 +252,29 @@ static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packe
     cmul_f32(a2_re, a2_im, w_re, w_im, &a2w_re, &a2w_im);
     cmul_f32(a2_re, a2_im, w2_re, w2_im, &a2w2_re, &a2w2_im);
 
-    // Y1 = A0 + A1*ω + A2*ω²
     const float32_t y1_re = x0_re + a1w_re + a2w2_re;
     const float32_t y1_im = x0_im + a1w_im + a2w2_im;
 
-    // Y2 = A0 + A1*ω² + A2*ω
-    const float32_t y2_re = x0_re + a1w2_re + a2w_re;
-    const float32_t y2_im = x0_im + a1w2_im + a2w_im;
-
-    // Select which mixed-radix output corresponds to bin k:
-    // - for k = 0..63   -> X[k]   = Y0
-    // - for k = 64..127 -> X[k]   = Y1 (k-64)
-    // - for k = 128..191-> X[k]   = Y2 (k-128)
-    float32_t xk_re, xk_im;
-    if (k < 64u)
+    /* X[k2] = Y0; X[k2+64] = Y1; X[k2+128] = Y2 (Y2 unused for 0..96 pack) */
+    if (k2 == 0u)
     {
-      xk_re = y0_re;
-      xk_im = y0_im;
+      packed_out[0] = y0_re;
     }
     else
     {
-      xk_re = y1_re;
-      xk_im = y1_im;
+      packed_out[2u * k2 + 0u] = y0_re;
+      packed_out[2u * k2 + 1u] = y0_im;
     }
 
-    // Pack to CMSIS RFFT format
-    if (k == 0u)
+    if (k2 <= 31u)
     {
-      packed_out[0] = xk_re;
+      const uint32_t kb = k2 + 64u;
+      packed_out[2u * kb + 0u] = y1_re;
+      packed_out[2u * kb + 1u] = y1_im;
     }
-    else if (k == 96u)
+    else if (k2 == 32u)
     {
-      packed_out[1] = xk_re; // Nyquist real
-    }
-    else
-    {
-      packed_out[2u * k + 0u] = xk_re;
-      packed_out[2u * k + 1u] = xk_im;
+      packed_out[1] = y1_re; /* Re{X[96]} Nyquist */
     }
   }
 }
