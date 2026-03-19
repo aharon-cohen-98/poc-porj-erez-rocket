@@ -216,6 +216,46 @@ static inline void cmul_f32(float32_t a_re, float32_t a_im,
   *out_im = a_re * b_im + a_im * b_re;
 }
 
+/* Twiddle + 3-point DFT for one k2; output bins written by caller (branch-free loops). */
+static inline void range_fft_combine_one_k2(uint32_t k2,
+                                            float32_t *out_y0_re, float32_t *out_y0_im,
+                                            float32_t *out_y1_re, float32_t *out_y1_im)
+{
+  const float32_t w_re = -0.5f;
+  const float32_t w_im = -0.8660254037844386f;
+  const float32_t w2_re = -0.5f;
+  const float32_t w2_im = 0.8660254037844386f;
+
+  const float32_t x0_re = range_fft_64_buf0[2u * k2 + 0u];
+  const float32_t x0_im = range_fft_64_buf0[2u * k2 + 1u];
+  const float32_t x1_re0 = range_fft_64_buf1[2u * k2 + 0u];
+  const float32_t x1_im0 = range_fft_64_buf1[2u * k2 + 1u];
+  const float32_t x2_re0 = range_fft_64_buf2[2u * k2 + 0u];
+  const float32_t x2_im0 = range_fft_64_buf2[2u * k2 + 1u];
+
+  const float32_t tw1_re = range_twiddle_w1[2u * k2 + 0u];
+  const float32_t tw1_im = range_twiddle_w1[2u * k2 + 1u];
+  const float32_t tw2_re = range_twiddle_w2[2u * k2 + 0u];
+  const float32_t tw2_im = range_twiddle_w2[2u * k2 + 1u];
+
+  float32_t a1_re, a1_im, a2_re, a2_im;
+  cmul_f32(x1_re0, x1_im0, tw1_re, tw1_im, &a1_re, &a1_im);
+  cmul_f32(x2_re0, x2_im0, tw2_re, tw2_im, &a2_re, &a2_im);
+
+  *out_y0_re = x0_re + a1_re + a2_re;
+  *out_y0_im = x0_im + a1_im + a2_im;
+
+  float32_t a1w_re, a1w_im, a1w2_re, a1w2_im;
+  float32_t a2w_re, a2w_im, a2w2_re, a2w2_im;
+  cmul_f32(a1_re, a1_im, w_re, w_im, &a1w_re, &a1w_im);
+  cmul_f32(a1_re, a1_im, w2_re, w2_im, &a1w2_re, &a1w2_im);
+  cmul_f32(a2_re, a2_im, w_re, w_im, &a2w_re, &a2w_im);
+  cmul_f32(a2_re, a2_im, w2_re, w2_im, &a2w2_re, &a2w2_im);
+
+  *out_y1_re = x0_re + a1w_re + a2w2_re;
+  *out_y1_im = x0_im + a1w_im + a2w2_im;
+}
+
 // 192-point real-input FFT: Cooley–Tukey N=3×64 with time index n = n1 + 3*n2
 // (polyphase-by-3 demux). Three 64-pt CFFTs then twiddle + 3-point DFT.
 // X[k2 + 64*r] = sum_{n1=0}^{2} F[n1,k2] * W_192^{(k2 + 64*r)*n1}, r=0,1,2.
@@ -243,63 +283,33 @@ static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packe
 
   uint32_t t2 = DWT->CYCCNT;
 
-  const float32_t w_re = -0.5f;
-  const float32_t w_im = -0.8660254037844386f;
-  const float32_t w2_re = -0.5f;
-  const float32_t w2_im = 0.8660254037844386f;
+  float32_t y0_re, y0_im, y1_re, y1_im;
 
-  for (uint32_t k2 = 0; k2 < 64; k2++)
+  range_fft_combine_one_k2(0u, &y0_re, &y0_im, &y1_re, &y1_im);
+  packed_out[0] = y0_re;
+  packed_out[128u] = y1_re;
+  packed_out[129u] = y1_im;
+
+  for (uint32_t k2 = 1u; k2 < 32u; k2++)
   {
-    const float32_t x0_re = range_fft_64_buf0[2u * k2 + 0u];
-    const float32_t x0_im = range_fft_64_buf0[2u * k2 + 1u];
-    const float32_t x1_re0 = range_fft_64_buf1[2u * k2 + 0u];
-    const float32_t x1_im0 = range_fft_64_buf1[2u * k2 + 1u];
-    const float32_t x2_re0 = range_fft_64_buf2[2u * k2 + 0u];
-    const float32_t x2_im0 = range_fft_64_buf2[2u * k2 + 1u];
+    range_fft_combine_one_k2(k2, &y0_re, &y0_im, &y1_re, &y1_im);
+    packed_out[2u * k2 + 0u] = y0_re;
+    packed_out[2u * k2 + 1u] = y0_im;
+    const uint32_t kb = k2 + 64u;
+    packed_out[2u * kb + 0u] = y1_re;
+    packed_out[2u * kb + 1u] = y1_im;
+  }
 
-    const float32_t tw1_re = range_twiddle_w1[2u * k2 + 0u];
-    const float32_t tw1_im = range_twiddle_w1[2u * k2 + 1u];
-    const float32_t tw2_re = range_twiddle_w2[2u * k2 + 0u];
-    const float32_t tw2_im = range_twiddle_w2[2u * k2 + 1u];
+  range_fft_combine_one_k2(32u, &y0_re, &y0_im, &y1_re, &y1_im);
+  packed_out[64u] = y0_re;
+  packed_out[65u] = y0_im;
+  packed_out[1] = y1_re; /* Re{X[96]} Nyquist */
 
-    float32_t a1_re, a1_im, a2_re, a2_im;
-    cmul_f32(x1_re0, x1_im0, tw1_re, tw1_im, &a1_re, &a1_im);
-    cmul_f32(x2_re0, x2_im0, tw2_re, tw2_im, &a2_re, &a2_im);
-
-    const float32_t y0_re = x0_re + a1_re + a2_re;
-    const float32_t y0_im = x0_im + a1_im + a2_im;
-
-    float32_t a1w_re, a1w_im, a1w2_re, a1w2_im;
-    float32_t a2w_re, a2w_im, a2w2_re, a2w2_im;
-    cmul_f32(a1_re, a1_im, w_re, w_im, &a1w_re, &a1w_im);
-    cmul_f32(a1_re, a1_im, w2_re, w2_im, &a1w2_re, &a1w2_im);
-    cmul_f32(a2_re, a2_im, w_re, w_im, &a2w_re, &a2w_im);
-    cmul_f32(a2_re, a2_im, w2_re, w2_im, &a2w2_re, &a2w2_im);
-
-    const float32_t y1_re = x0_re + a1w_re + a2w2_re;
-    const float32_t y1_im = x0_im + a1w_im + a2w2_im;
-
-    /* X[k2] = Y0; X[k2+64] = Y1; X[k2+128] = Y2 (Y2 unused for 0..96 pack) */
-    if (k2 == 0u)
-    {
-      packed_out[0] = y0_re;
-    }
-    else
-    {
-      packed_out[2u * k2 + 0u] = y0_re;
-      packed_out[2u * k2 + 1u] = y0_im;
-    }
-
-    if (k2 <= 31u)
-    {
-      const uint32_t kb = k2 + 64u;
-      packed_out[2u * kb + 0u] = y1_re;
-      packed_out[2u * kb + 1u] = y1_im;
-    }
-    else if (k2 == 32u)
-    {
-      packed_out[1] = y1_re; /* Re{X[96]} Nyquist */
-    }
+  for (uint32_t k2 = 33u; k2 < 64u; k2++)
+  {
+    range_fft_combine_one_k2(k2, &y0_re, &y0_im, &y1_re, &y1_im);
+    packed_out[2u * k2 + 0u] = y0_re;
+    packed_out[2u * k2 + 1u] = y0_im;
   }
 
   uint32_t t3 = DWT->CYCCNT;
