@@ -72,7 +72,7 @@ SDRAM_HandleTypeDef hsdram1;
 
 /* USER CODE BEGIN PV */
 arm_cfft_instance_f32 cfft_instance;
-arm_cfft_instance_f32 cfft_64_instance;  // 64-point CFFT for 192-point (3×64) Range FFT
+arm_rfft_fast_instance_f32 rfft_64_instance;  // 64-point RFFT for 192-point (3×64) Range FFT
 
 // OPTION B: FFT buffers in AXI SRAM for direct DMA-to-FFT flow (no copy overhead)
 // With D-Cache enabled, performance is still excellent (~10-12K cycles vs 8.9K in DTCM)
@@ -112,6 +112,11 @@ __attribute__((aligned(32))) float32_t hamming_window_doppler[NUM_CHIRPS];
 __attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf0[64 * 2];
 __attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf1[64 * 2];
 __attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf2[64 * 2];
+// 3× 64 real buffers for RFFT input (demux); one packed temp for RFFT output before expand
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_rfft_real0[64];
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_rfft_real1[64];
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_rfft_real2[64];
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_rfft_packed[64];
 // Twiddles for W192^k and W192^(2k) for k=0..(N/2), stored as complex (Re,Im)
 // For N=192, this covers k=0..96 inclusive (97 values).
 __attribute__((aligned(32))) float32_t range_twiddle_w1[(FFT_SIZE/2 + 1) * 2];
@@ -257,30 +262,52 @@ static inline void range_fft_combine_one_k2(uint32_t k2,
   *out_y1_im = x0_im + a1w_im + a2w2_im;
 }
 
+// Expand 64-point RFFT packed output to 128-float complex (Re,Im interleaved) for combine.
+// packed: CMSIS layout [0]=DC, [1]=Nyquist, [2*k],[2*k+1]=Re(X[k]),Im(X[k]) for k=1..31.
+// complex_buf: [2*k2]=Re(S[k2]), [2*k2+1]=Im(S[k2]) for k2=0..63; bins 33..63 from conjugate symmetry.
+static void range_rfft_expand_64_to_128(const float32_t *packed, float32_t *complex_buf)
+{
+  complex_buf[0u] = packed[0u];
+  complex_buf[1u] = 0.0f;
+  for (uint32_t k2 = 1u; k2 < 32u; k2++)
+  {
+    complex_buf[2u * k2 + 0u] = packed[2u * k2 + 0u];
+    complex_buf[2u * k2 + 1u] = packed[2u * k2 + 1u];
+  }
+  complex_buf[64u] = packed[1u];
+  complex_buf[65u] = 0.0f;
+  for (uint32_t k2 = 33u; k2 < 64u; k2++)
+  {
+    const uint32_t k2_conj = 64u - k2;
+    complex_buf[2u * k2 + 0u] = complex_buf[2u * k2_conj + 0u];
+    complex_buf[2u * k2 + 1u] = -complex_buf[2u * k2_conj + 1u];
+  }
+}
+
 // 192-point real-input FFT: Cooley–Tukey N=3×64 with time index n = n1 + 3*n2
-// (polyphase-by-3 demux). Three 64-pt CFFTs then twiddle + 3-point DFT.
+// (polyphase-by-3 demux). Three 64-pt RFFTs then expand + twiddle + 3-point DFT.
 // X[k2 + 64*r] = sum_{n1=0}^{2} F[n1,k2] * W_192^{(k2 + 64*r)*n1}, r=0,1,2.
 // Output packed like CMSIS `arm_rfft_fast_f32`: DC, Nyquist, then Re/Im pairs.
 static void range_fft_192_real_packed(const float32_t *time_in, float32_t *packed_out)
 {
   uint32_t t0 = DWT->CYCCNT;
 
-  // Demux: seq_r[n2] = x[n1 + 3*n2] with n1=r, n2=0..63 (NOT contiguous blocks of 64)
-  for (uint32_t n2 = 0; n2 < 64; n2++)
+  // Demux: seq_r[n2] = x[n1 + 3*n2] with n1=r, n2=0..63 into three real length-64 buffers
+  for (uint32_t n2 = 0u; n2 < 64u; n2++)
   {
-    range_fft_64_buf0[2u * n2 + 0u] = time_in[3u * n2 + 0u];
-    range_fft_64_buf0[2u * n2 + 1u] = 0.0f;
-    range_fft_64_buf1[2u * n2 + 0u] = time_in[3u * n2 + 1u];
-    range_fft_64_buf1[2u * n2 + 1u] = 0.0f;
-    range_fft_64_buf2[2u * n2 + 0u] = time_in[3u * n2 + 2u];
-    range_fft_64_buf2[2u * n2 + 1u] = 0.0f;
+    range_rfft_real0[n2] = time_in[3u * n2 + 0u];
+    range_rfft_real1[n2] = time_in[3u * n2 + 1u];
+    range_rfft_real2[n2] = time_in[3u * n2 + 2u];
   }
 
   uint32_t t1 = DWT->CYCCNT;
 
-  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf0, 0, 1);
-  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf1, 0, 1);
-  arm_cfft_f32(&cfft_64_instance, range_fft_64_buf2, 0, 1);
+  arm_rfft_fast_f32(&rfft_64_instance, range_rfft_real0, range_rfft_packed, 0);
+  range_rfft_expand_64_to_128(range_rfft_packed, range_fft_64_buf0);
+  arm_rfft_fast_f32(&rfft_64_instance, range_rfft_real1, range_rfft_packed, 0);
+  range_rfft_expand_64_to_128(range_rfft_packed, range_fft_64_buf1);
+  arm_rfft_fast_f32(&rfft_64_instance, range_rfft_real2, range_rfft_packed, 0);
+  range_rfft_expand_64_to_128(range_rfft_packed, range_fft_64_buf2);
 
   uint32_t t2 = DWT->CYCCNT;
 
@@ -388,7 +415,7 @@ int main(void)
 
   // Initialize FFT instances
   arm_cfft_init_f32(&cfft_instance, NUM_CHIRPS);          // 32-point complex FFT for Doppler
-  arm_cfft_init_f32(&cfft_64_instance, 64);               // 64-point complex FFT for 192-point (3×64) Range FFT
+  arm_rfft_fast_init_f32(&rfft_64_instance, 64);          // 64-point real FFT for 192-point (3×64) Range FFT
 
   // Generate Hamming window coefficients for Range FFT (FFT_SIZE points)
   // Hamming window: w(n) = 0.54 - 0.46 * cos(2*pi*n/(N-1))
