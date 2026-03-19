@@ -108,9 +108,10 @@ __attribute__((aligned(32))) float32_t hamming_window_doppler[NUM_CHIRPS];
 
 // 192-point Range FFT (3×64) working buffers and twiddles
 // - 3 complex buffers, each holds 64 complex samples (Re,Im interleaved) => 128 floats each
-__attribute__((aligned(32))) float32_t range_fft_64_buf0[64 * 2];
-__attribute__((aligned(32))) float32_t range_fft_64_buf1[64 * 2];
-__attribute__((aligned(32))) float32_t range_fft_64_buf2[64 * 2];
+// - In DTCM for zero-wait access during the three arm_cfft_f32() calls (reduces Range 3xCFFT Total)
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf0[64 * 2];
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf1[64 * 2];
+__attribute__((aligned(32), section(".dtcm_ram"))) float32_t range_fft_64_buf2[64 * 2];
 // Twiddles for W192^k and W192^(2k) for k=0..(N/2), stored as complex (Re,Im)
 // For N=192, this covers k=0..96 inclusive (97 values).
 __attribute__((aligned(32))) float32_t range_twiddle_w1[(FFT_SIZE/2 + 1) * 2];
